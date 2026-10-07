@@ -1522,9 +1522,19 @@ class AbletonMCP(ControlSurface):
         # a momentary spike, so the length carries the hold or ramp segment.
         for step_time, step_len, step_value in steps:
             env.insert_step(step_time, step_len, step_value)
+        # Live picks up the new parameter value on its next update, so the envelope
+        # created above may still start from the old value. Report whether beat 0
+        # reads the ramp's first value; the MCP tool rewrites the ramp if not.
+        start_settled = None
+        if start_value_set is not None:
+            try:
+                tolerance = 1e-5 * max(1.0, abs(float(param.max) - float(param.min)))
+                start_settled = abs(float(env.value_at_time(0.0)) - steps[0][2]) <= tolerance
+            except Exception:
+                pass
         return {"parameter": param.name, "device": device.name, "mode": mode,
                 "point_count": len(points), "step_count": len(steps),
-                "start_value_set": start_value_set,
+                "start_value_set": start_value_set, "start_settled": start_settled,
                 "start": min(st[0] for st in steps),
                 "end": max(st[0] + st[1] for st in steps)}
 

@@ -151,9 +151,13 @@ def test_bad_requests_are_rejected(points, mode, step, message):
 class FakeEnvelope:
     def __init__(self):
         self.steps = []
+        self.initial = None
 
     def insert_step(self, time, length, value):
         self.steps.append((time, length, value))
+
+    def value_at_time(self, t):
+        return _sample(self.steps, t, baseline=self.initial)
 
 
 class FakeClip:
@@ -171,7 +175,11 @@ class FakeClip:
         return None  # no envelope yet: forces create_automation_envelope
 
     def create_automation_envelope(self, param):
-        self.created_from = param.value
+        # Like Live 11: the new envelope starts from the value the parameter had at
+        # Live's last update, which can lag a value set in the same update.
+        self.created_from = getattr(param, "applied", param.value)
+        self.envelope = FakeEnvelope()
+        self.envelope.initial = self.created_from
         return self.envelope
 
 
@@ -218,6 +226,27 @@ def test_parameter_is_left_alone_unless_a_ramp_starts_at_beat_zero(points, mode)
     assert clip.created_from == 0.7 and result["start_value_set"] is None
 
 
+def test_start_settled_reports_whether_beat_zero_reads_the_first_value():
+    """Found on Live 11.3.43: setting the parameter and creating the envelope in one
+    update left beat 0 at the old value; a second write after an update was clean."""
+    param = SimpleNamespace(name="Frequency", min=20.0, max=135.0, value=127.0, applied=127.0)
+    clip = FakeClip()
+    points = [{"time": 0, "value": 40}, {"time": 16, "value": 120}]
+    first = write_automation(_bridge(clip, param), 0, 0, 0, "Frequency", points, "ramp")
+    assert first["start_value_set"] == 40.0 and first["start_settled"] is False
+    assert clip.envelope.value_at_time(0.0) == 127.0
+    param.applied = param.value  # Live's next update
+    second = write_automation(_bridge(clip, param), 0, 0, 0, "Frequency", points, "ramp")
+    assert second["start_settled"] is True and clip.envelope.value_at_time(0.0) == 40.0
+    assert clip.envelope.value_at_time(15.999) == 120.0
+
+
+def test_start_settled_is_only_reported_for_ramps_from_beat_zero():
+    clip = FakeClip()
+    points = [{"time": 0, "value": 0.2, "duration": 4}]
+    assert write_automation(_bridge(clip), 0, 0, 0, "F", points)["start_settled"] is None
+
+
 def test_a_parameter_that_refuses_the_start_value_still_gets_its_ramp():
     class Stubborn:
         name, min, max = "Locked", 0.0, 1.0
@@ -233,7 +262,8 @@ def test_a_parameter_that_refuses_the_start_value_still_gets_its_ramp():
     clip = FakeClip()
     points = [{"time": 0, "value": 0.2}, {"time": 4, "value": 0.9}]
     result = write_automation(_bridge(clip, Stubborn()), 0, 0, 0, "Locked", points, "ramp")
-    assert result["start_value_set"] is None and len(clip.envelope.steps) == 65
+    assert result["start_value_set"] is None and result["start_settled"] is None
+    assert len(clip.envelope.steps) == 65
 
 
 def test_write_automation_default_call_is_unchanged():
@@ -300,3 +330,49 @@ def test_tool_sends_mode_and_flags_an_outdated_remote_script(monkeypatch):
     props = tool.inputSchema["properties"]
     assert all(props[k].get("description") for k in props)
     assert set(props["mode"]["enum"]) == {"points", "ramp"}
+
+
+def _tool(monkeypatch, replies):
+    from ableton_live_mcp.tools import arrangement
+
+    sent, slept = [], []
+    connection = SimpleNamespace(send_command=lambda c, p: sent.append((c, p)) or replies.pop(0))
+    monkeypatch.setattr(arrangement, "get_ableton_connection", lambda: connection)
+    monkeypatch.setattr(arrangement.time, "sleep", slept.append)
+    return arrangement.write_automation, sent, slept
+
+
+RAMP_REPLY = {
+    "parameter": "Frequency",
+    "device": "Auto Filter",
+    "mode": "ramp",
+    "point_count": 2,
+    "step_count": 257,
+    "start": 0.0,
+    "end": 16.0,
+    "start_value_set": 40.0,
+}
+
+
+def test_tool_rewrites_until_beat_zero_settles(monkeypatch):
+    replies = [{**RAMP_REPLY, "start_settled": False}, {**RAMP_REPLY, "start_settled": True}]
+    write, sent, slept = _tool(monkeypatch, replies)
+    points = [{"time": 0, "value": 40}, {"time": 16, "value": 120}]
+    message = write(None, 0, 1, 1, "Frequency", points, "ramp")
+    assert len(sent) == 2 and sent[0] == sent[1] and slept == [0.05]
+    assert "rewrote the ramp 1x" in message and "Warning" not in message
+
+
+def test_tool_warns_when_beat_zero_never_settles(monkeypatch):
+    write, sent, slept = _tool(monkeypatch, [{**RAMP_REPLY, "start_settled": False}] * 4)
+    message = write(None, 0, 1, 1, "Frequency", [{"time": 0, "value": 40}], "ramp")
+    assert len(sent) == 4 and slept == [0.05, 0.2, 0.5]
+    assert "Warning: after 3 rewrites beat 0 still starts from the old value" in message
+
+
+def test_tool_does_not_rewrite_settled_or_point_writes(monkeypatch):
+    replies = [{**RAMP_REPLY, "start_settled": True}, {**RAMP_REPLY, "start_settled": None}]
+    write, sent, slept = _tool(monkeypatch, replies)
+    write(None, 0, 1, 1, "Frequency", [{"time": 0, "value": 40}], "ramp")
+    write(None, 0, 1, 1, "Frequency", [{"time": 0, "value": 40}])
+    assert len(sent) == 2 and slept == []
