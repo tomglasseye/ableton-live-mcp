@@ -1,9 +1,11 @@
 """Arrangement view, timeline placement, and clip automation."""
 
 import json
+from typing import Annotated, Literal
 
 from mcp.server.fastmcp import Context
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from ..app import mcp
 from ..connection import get_ableton_connection
@@ -104,17 +106,61 @@ def delete_arrangement_clip(ctx: Context, track_index: int, arrangement_clip_ind
     return f"Deleted arrangement clip '{result.get('name')}' ({result.get('start_time')}-{result.get('end_time')})"
 
 
+AutomationPoints = Annotated[
+    list[dict[str, float]],
+    Field(
+        min_length=1,
+        description=(
+            'Breakpoints as {"time": beats from clip start, "value": native parameter '
+            'value, "duration": optional beats to hold the value}.'
+        ),
+    ),
+]
+AutomationMode = Annotated[
+    Literal["points", "ramp"],
+    Field(
+        description=(
+            '"points" writes each point as a step of its duration (default 0, a spike); '
+            '"ramp" joins consecutive points with linear ramps.'
+        )
+    ),
+]
+RampStepLength = Annotated[
+    float,
+    Field(gt=0, le=4, description="Ramp resolution in beats; 0.0625 (1/16 beat) by default."),
+]
+
+
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 def write_automation(
     ctx: Context,
-    track_index: int,
-    clip_index: int,
-    device_index: int,
-    parameter: str | int,
-    points: list[dict[str, float]],
+    track_index: TrackIndex,
+    clip_index: ClipIndex,
+    device_index: DeviceIndex,
+    parameter: DeviceParameter,
+    points: AutomationPoints,
+    mode: AutomationMode = "points",
+    step_length: RampStepLength = 0.0625,
 ) -> str:
-    """Write clip automation for a device parameter. points = [{"time": beats, "value": v}, ...].
-    Replaces any existing envelope for that parameter on the clip."""
+    """Write clip automation for one device parameter on a Session clip, replacing any
+    existing envelope for that parameter on the clip.
+
+    Times are in beats from the clip start. Values use the parameter's native range:
+    read min and max with get_device_parameters first. Out-of-range values, bad times
+    and over-long ramps are rejected before anything is written.
+
+    mode="points" (default): each point becomes a step lasting its "duration" beats.
+    Without a duration the step has zero length, which plays as a momentary spike,
+    so give a duration to hold a value.
+
+    mode="ramp": consecutive points are joined by a linear ramp, written as contiguous
+    steps of about step_length beats. Points must be in time order; two points at the
+    same time make an instant jump. The last point holds until the clip end unless it
+    has a duration; only the last point may have one.
+
+    Example, a 4-bar filter sweep on a 4-bar clip:
+      points=[{"time": 0, "value": 0.2}, {"time": 16, "value": 0.9}], mode="ramp"
+    """
     r = get_ableton_connection().send_command(
         "write_automation",
         {
@@ -123,9 +169,20 @@ def write_automation(
             "device_index": device_index,
             "parameter": parameter,
             "points": points,
+            "mode": mode,
+            "step_length": step_length,
         },
     )
-    return f"Wrote {r.get('point_count')} automation points for {r.get('parameter')}"
+    if "step_count" not in r:
+        return (
+            f"Wrote {r.get('point_count')} automation points for {r.get('parameter')}, "
+            "but the Remote Script running in Live is older than this server and ignores "
+            "mode and duration. Run install, delete the script's __pycache__ and restart Live."
+        )
+    return (
+        f"Wrote {r['step_count']} steps from {r.get('point_count')} points ({r.get('mode')}) "
+        f"for {r.get('parameter')} on {r.get('device')}, beats {r.get('start')} to {r.get('end')}"
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
