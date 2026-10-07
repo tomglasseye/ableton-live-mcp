@@ -49,8 +49,11 @@ def _automation_steps(points, mode="points", step_length=AUTOMATION_RAMP_STEP,
     mode "points": one step per point, length = the point's "duration" (default
     0.0, the original behaviour). mode "ramp": consecutive points are joined by
     contiguous steps about step_length beats long, each holding the linear value
-    at its start; the last point holds for its "duration", or until hold_until
-    when it has none. Pure, so a bad request fails before the envelope changes."""
+    at its start, except that the last segment spreads its values so its final
+    step already holds the final value (Live 11 drops a 0-length hold at the clip
+    end, so the ramp would otherwise stop one step short). The last point holds
+    for its "duration", or until hold_until when it has none. Pure, so a bad
+    request fails before the envelope changes."""
     if mode not in ("points", "ramp"):
         raise ValueError(f"mode must be 'points' or 'ramp', got {mode!r}")
     if not isinstance(points, (list, tuple)) or not points:
@@ -88,16 +91,19 @@ def _automation_steps(points, mode="points", step_length=AUTOMATION_RAMP_STEP,
     for (t0, v0, _), (t1, v1, _) in zip(parsed, parsed[1:]):
         span = t1 - t0
         if span > 0:  # same time twice = an instant jump to the next segment's value
-            segments.append((t0, v0, t1, v1, max(1, int(math.ceil(span / step_length - 1e-9)))))
+            segments.append([t0, v0, t1, v1, max(1, int(math.ceil(span / step_length - 1e-9)))])
+    if segments:
+        segments[-1][4] = max(2, segments[-1][4])  # room for both of its end values
     total = sum(seg[4] for seg in segments) + 1
     if total > MAX_AUTOMATION_STEPS:
         raise ValueError(f"this ramp needs {total} steps (limit {MAX_AUTOMATION_STEPS}); use a larger step_length")
     steps = []
-    for t0, v0, t1, v1, n in segments:
+    for i, (t0, v0, t1, v1, n) in enumerate(segments):
+        divisor = n - 1 if i == len(segments) - 1 else n
         for k in range(n):
             start = t0 + (t1 - t0) * k / n
             end = t1 if k == n - 1 else t0 + (t1 - t0) * (k + 1) / n
-            steps.append((start, end - start, v0 + (v1 - v0) * k / n))
+            steps.append((start, end - start, v1 if k == divisor else v0 + (v1 - v0) * k / divisor))
     t_last, v_last, d_last = parsed[-1]
     if d_last is None:
         d_last = max(0.0, hold_until - t_last) if hold_until is not None else 0.0
@@ -1493,6 +1499,17 @@ class AbletonMCP(ControlSurface):
             clip.clear_envelope(param)
         except Exception:
             pass
+        # A new envelope starts from the parameter's current value, and Live 11
+        # keeps that value at the exact clip start, so a ramp from beat 0 jumps
+        # through it on every loop (an audible click). Setting the parameter to
+        # the ramp's first value first removes the jump. Points mode is left alone.
+        start_value_set = None
+        if mode == "ramp" and steps[0][0] == 0.0:
+            try:
+                param.value = steps[0][2]
+                start_value_set = float(param.value)
+            except Exception:
+                pass
         env = clip.automation_envelope(param)
         if env is None and hasattr(clip, "create_automation_envelope"):
             env = clip.create_automation_envelope(param)
@@ -1507,6 +1524,7 @@ class AbletonMCP(ControlSurface):
             env.insert_step(step_time, step_len, step_value)
         return {"parameter": param.name, "device": device.name, "mode": mode,
                 "point_count": len(points), "step_count": len(steps),
+                "start_value_set": start_value_set,
                 "start": min(st[0] for st in steps),
                 "end": max(st[0] + st[1] for st in steps)}
 

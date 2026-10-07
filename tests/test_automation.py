@@ -44,10 +44,14 @@ write_automation = NAMESPACE["_write_automation"]
 MAX_STEPS = NAMESPACE["MAX_AUTOMATION_STEPS"]
 
 
-def _sample(steps, t):
-    """Value of a staircase at time t: the latest step that has started by t."""
-    started = [s for s in steps if s[0] <= t + 1e-12]
-    return max(started, key=lambda s: s[0])[2]
+def _sample(steps, t, baseline=None):
+    """Read a staircase the way Live 11's value_at_time does: at the exact start of a
+    step it returns the value before it, and past a step's end it is back at the
+    baseline. Zero-length steps are never visible."""
+    for start, length, value in reversed(steps):
+        if start < t <= start + length:
+            return value
+    return baseline
 
 
 def test_points_mode_defaults_to_zero_length_steps():
@@ -71,14 +75,28 @@ def test_ramp_is_contiguous_linear_and_hits_both_ends():
     values = [v for _, _, v in steps]
     assert values == sorted(values)
     assert steps[0] == (0.0, 0.0625, 0.2)
-    assert steps[-1] == (16.0, 16.0, 0.9)  # last value holds until the clip end
-    for t in (0.0, 3.3, 8.0, 15.99):
-        assert _sample(steps, t) == pytest.approx(0.2 + 0.7 * t / 16, abs=0.7 / 256 + 1e-9)
+    assert steps[-2] == (15.9375, 0.0625, 0.9)  # the ramp itself finishes on 0.9
+    assert steps[-1] == (16.0, 16.0, 0.9)  # then holds until the clip end
+    for t in (0.001, 3.3, 8.03, 15.99):
+        assert _sample(steps, t) == pytest.approx(0.2 + 0.7 * t / 16, abs=0.7 / 255 + 1e-9)
+
+
+def test_ramp_ending_at_the_clip_end_reaches_its_final_value():
+    """Found on Live 11.3.43: the 0-length hold at the clip end is invisible, so the
+    ramp topped out one step short (119.6875 instead of 120 at 1/16 beat, and a full
+    step short at coarse resolutions)."""
+    for step in (0.0625, 4.0):
+        points = [{"time": 0, "value": 40}, {"time": 16, "value": 120}]
+        steps = steps_for(points, "ramp", step, hold_until=16.0)
+        assert steps[-1] == (16.0, 0.0, 120.0)
+        assert _sample(steps, 15.999) == 120.0
+        assert _sample(steps, 0.001) == 40.0
 
 
 def test_ramp_steps_fit_spans_that_do_not_divide_evenly():
     steps = steps_for([{"time": 0, "value": 0}, {"time": 1, "value": 1}], "ramp", 0.3)
     assert [round(s[1], 9) for s in steps[:-1]] == [0.25] * 4
+    assert [round(s[2], 9) for s in steps[:-1]] == [0, 0.333333333, 0.666666667, 1]
     assert steps[-2][0] + steps[-2][1] == 1.0
     assert steps[-1] == (1.0, 0.0, 1.0)  # no clip end known: last point is momentary
 
@@ -91,8 +109,10 @@ def test_ramp_last_point_duration_and_instant_jumps():
         {"time": 8, "value": 1, "duration": 2},
     ]
     steps = steps_for(saw, "ramp", 1.0, hold_until=100.0)
-    assert _sample(steps, 3.5) == 0.75
-    assert _sample(steps, 4.0) == 0.0  # the jump lands on the next segment's start
+    assert _sample(steps, 3.5) == 0.75  # earlier segments: value at each step's start
+    assert _sample(steps, 4.0) == 0.75  # Live reads the value before the jump...
+    assert _sample(steps, 4.001) == 0.0  # ...and the next segment starts on its value
+    assert _sample(steps, 7.5) == 1.0  # the last segment finishes on the final value
     assert steps[-1] == (8.0, 2.0, 1.0)
 
 
@@ -151,11 +171,12 @@ class FakeClip:
         return None  # no envelope yet: forces create_automation_envelope
 
     def create_automation_envelope(self, param):
+        self.created_from = param.value
         return self.envelope
 
 
-def _bridge(clip):
-    param = SimpleNamespace(name="Filter Freq", min=0.0, max=1.0)
+def _bridge(clip, param=None):
+    param = param or SimpleNamespace(name="Filter Freq", min=0.0, max=1.0, value=0.7)
     device = SimpleNamespace(name="Auto Filter")
     return SimpleNamespace(
         _get_clip=lambda *_: clip,
@@ -173,6 +194,46 @@ def test_write_automation_ramps_and_holds_to_the_clip_end():
     assert clip.envelope.steps[-1] == (4.0, 12.0, 0.9)  # holds to max(end_marker, loop_end)
     assert result["step_count"] == len(clip.envelope.steps) == 17
     assert (result["start"], result["end"], result["mode"]) == (0.0, 16.0, "ramp")
+
+
+def test_ramp_from_beat_zero_starts_the_envelope_on_its_first_value():
+    """Found on Live 11.3.43: a new envelope starts from the parameter's current
+    value and Live keeps it at the exact clip start, which clicked on every loop."""
+    clip = FakeClip()
+    points = [{"time": 0, "value": 0.2}, {"time": 4, "value": 0.9}]
+    result = write_automation(_bridge(clip), 0, 0, 0, "Filter Freq", points, "ramp", 0.25)
+    assert clip.created_from == 0.2 and result["start_value_set"] == 0.2
+
+
+@pytest.mark.parametrize(
+    "points, mode",
+    [
+        ([{"time": 0, "value": 0.2, "duration": 4}], "points"),
+        ([{"time": 2, "value": 0.2}, {"time": 4, "value": 0.9}], "ramp"),
+    ],
+)
+def test_parameter_is_left_alone_unless_a_ramp_starts_at_beat_zero(points, mode):
+    clip = FakeClip()
+    result = write_automation(_bridge(clip), 0, 0, 0, "Filter Freq", points, mode)
+    assert clip.created_from == 0.7 and result["start_value_set"] is None
+
+
+def test_a_parameter_that_refuses_the_start_value_still_gets_its_ramp():
+    class Stubborn:
+        name, min, max = "Locked", 0.0, 1.0
+
+        @property
+        def value(self):
+            return 0.7
+
+        @value.setter
+        def value(self, _):
+            raise RuntimeError("parameter is disabled")
+
+    clip = FakeClip()
+    points = [{"time": 0, "value": 0.2}, {"time": 4, "value": 0.9}]
+    result = write_automation(_bridge(clip, Stubborn()), 0, 0, 0, "Locked", points, "ramp")
+    assert result["start_value_set"] is None and len(clip.envelope.steps) == 65
 
 
 def test_write_automation_default_call_is_unchanged():
@@ -223,13 +284,15 @@ def test_tool_sends_mode_and_flags_an_outdated_remote_script(monkeypatch):
             "step_count": 17,
             "start": 0.0,
             "end": 16.0,
+            "start_value_set": 40.0,
         },
         {"parameter": "Freq", "point_count": 2},  # what a 1.8.1 Remote Script returns
     ]
     connection = SimpleNamespace(send_command=lambda c, p: sent.append((c, p)) or replies.pop(0))
     monkeypatch.setattr(arrangement, "get_ableton_connection", lambda: connection)
     points = [{"time": 0, "value": 0.2}, {"time": 4, "value": 0.9}]
-    assert "17 steps" in arrangement.write_automation(None, 0, 0, 0, "Freq", points, "ramp")
+    message = arrangement.write_automation(None, 0, 0, 0, "Freq", points, "ramp")
+    assert "17 steps" in message and "set Freq to 40.0" in message
     assert sent[0][1]["mode"] == "ramp" and sent[0][1]["step_length"] == 0.0625
     assert "older than this server" in arrangement.write_automation(None, 0, 0, 0, "Freq", points)
 

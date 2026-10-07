@@ -154,9 +154,12 @@ def write_automation(
     so give a duration to hold a value.
 
     mode="ramp": consecutive points are joined by a linear ramp, written as contiguous
-    steps of about step_length beats. Points must be in time order; two points at the
-    same time make an instant jump. The last point holds until the clip end unless it
-    has a duration; only the last point may have one.
+    steps of about step_length beats, and the final value is reached by the ramp's
+    end. Points must be in time order; two points at the same time make an instant
+    jump. The last point holds until the clip end unless it has a duration; only the
+    last point may have one. A ramp that starts at beat 0 also sets the parameter
+    itself to the first value, so the clip does not jump from the old value at its
+    start on every loop.
 
     Example, a 4-bar filter sweep on a 4-bar clip:
       points=[{"time": 0, "value": 0.2}, {"time": 16, "value": 0.9}], mode="ramp"
@@ -179,10 +182,15 @@ def write_automation(
             "but the Remote Script running in Live is older than this server and ignores "
             "mode and duration. Run install, delete the script's __pycache__ and restart Live."
         )
-    return (
+    message = (
         f"Wrote {r['step_count']} steps from {r.get('point_count')} points ({r.get('mode')}) "
         f"for {r.get('parameter')} on {r.get('device')}, beats {r.get('start')} to {r.get('end')}"
     )
+    if r.get("start_value_set") is not None:
+        message += (
+            f"; set {r.get('parameter')} to {r['start_value_set']} so beat 0 starts on the ramp"
+        )
+    return message
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
