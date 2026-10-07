@@ -1,6 +1,7 @@
 """Arrangement view, timeline placement, and clip automation."""
 
 import json
+import time
 from typing import Annotated, Literal
 
 from mcp.server.fastmcp import Context
@@ -125,6 +126,10 @@ AutomationMode = Annotated[
         )
     ),
 ]
+# Pauses before rewriting a ramp whose beat 0 still holds the old value. Live applies
+# a parameter change on its next update; slower plugins can take a little longer.
+RAMP_SETTLE_DELAYS = (0.05, 0.2, 0.5)
+
 RampStepLength = Annotated[
     float,
     Field(gt=0, le=4, description="Ramp resolution in beats; 0.0625 (1/16 beat) by default."),
@@ -159,23 +164,32 @@ def write_automation(
     jump. The last point holds until the clip end unless it has a duration; only the
     last point may have one. A ramp that starts at beat 0 also sets the parameter
     itself to the first value, so the clip does not jump from the old value at its
-    start on every loop.
+    start on every loop. Live applies that value on its next update, so the tool
+    rewrites the ramp (up to three times, pausing briefly) until beat 0 reads the
+    first value. Inside batch_commands it cannot wait: start_settled false in the
+    result means beat 0 still jumps, so run write_automation again on its own.
 
     Example, a 4-bar filter sweep on a 4-bar clip:
       points=[{"time": 0, "value": 0.2}, {"time": 16, "value": 0.9}], mode="ramp"
     """
-    r = get_ableton_connection().send_command(
-        "write_automation",
-        {
-            "track_index": track_index,
-            "clip_index": clip_index,
-            "device_index": device_index,
-            "parameter": parameter,
-            "points": points,
-            "mode": mode,
-            "step_length": step_length,
-        },
-    )
+    connection = get_ableton_connection()
+    params = {
+        "track_index": track_index,
+        "clip_index": clip_index,
+        "device_index": device_index,
+        "parameter": parameter,
+        "points": points,
+        "mode": mode,
+        "step_length": step_length,
+    }
+    r = connection.send_command("write_automation", params)
+    rewrites = 0
+    for delay in RAMP_SETTLE_DELAYS:
+        if r.get("start_settled") is not False:
+            break
+        time.sleep(delay)
+        r = connection.send_command("write_automation", params)
+        rewrites += 1
     if "step_count" not in r:
         return (
             f"Wrote {r.get('point_count')} automation points for {r.get('parameter')}, "
@@ -190,6 +204,13 @@ def write_automation(
         message += (
             f"; set {r.get('parameter')} to {r['start_value_set']} so beat 0 starts on the ramp"
         )
+    if r.get("start_settled") is False:
+        message += (
+            f". Warning: after {rewrites} rewrites beat 0 still starts from the old value "
+            "(a click on every loop); run write_automation again"
+        )
+    elif rewrites:
+        message += f" (rewrote the ramp {rewrites}x while Live applied the new value)"
     return message
 
 
