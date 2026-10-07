@@ -188,6 +188,11 @@ def read_automation(
     start to the clip end; at most 1024 samples). Values are native parameter values
     with a display string where Live provides one. has_envelope is false when the
     clip has no automation for that parameter. Read-only.
+
+    At the exact time a step or breakpoint starts, Live returns the value just
+    before it, so a grid that lands on step boundaries reads one step behind (and
+    beat 0 reads the envelope's initial value). To check a step's value, sample a
+    little after its start, e.g. times=[0.01, 4.01, 8.01].
     """
     r = get_ableton_connection().send_command(
         "read_automation",
