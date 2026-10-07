@@ -1535,7 +1535,8 @@ class AbletonMCP(ControlSurface):
                          times=None, start=None, end=None, step=None):
         """Sample a clip envelope with AutomationEnvelope.value_at_time(). Pass
         explicit beat times, or a start/end/step grid (defaults: clip start to
-        clip end, 1 beat apart)."""
+        clip end, 1 beat apart). Live 11 returns the value just before a step at
+        that step's exact start time."""
         clip = self._get_clip(track_index, clip_index)
         device = self._get_device(track_index, device_index)
         param = self._resolve_parameter(device, parameter)
